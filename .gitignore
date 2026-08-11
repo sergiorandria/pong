@@ -1,0 +1,9 @@
+# build artifacts
+*.o
+*.d
+pong
+ping
+
+# sanitizer / coverage output
+*.gcda
+*.gcno

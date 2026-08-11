@@ -1,149 +1,223 @@
-# Network Scanner
+# pong
 
-A lightweight network scanning utility that uses ICMP echo requests (ping) to check the availability of network endpoints. This tool sends raw ICMP packets to determine if a target host is reachable on the network.
+A lightweight, dependency-free network reachability scanner that uses ICMP echo
+requests (ping) to check whether endpoints are up. It supports IPv4 and IPv6,
+works without root, spaces probes 1 second apart by default, and can blast the
+full payload in a single burst (`--flood`). `.onion` / `.i2p` hidden-service
+addresses are probed through a SOCKS5 proxy.
 
 ## Features
 
-- Send ICMP echo requests to check host availability
-- Configurable target IP address and port
-- Raw socket implementation with custom IP and ICMP header construction
-- Automatic detection of local IPv4 address
-- Success rate statistics
-- Detailed packet information reporting
+- ICMP echo request scanning for IPv4 **and** IPv6
+- **1 second between probes by default** (`-i/--interval`, in ms)
+- **`-f/--flood`**: send the full payload (all `-c count` probes) in one
+  back-to-back burst — no 1 s overhead between requests — then collect replies
+- Raw sockets automatically when `CAP_NET_RAW` is present; otherwise falls back
+  to unprivileged ICMP datagram sockets — **no root required**
+- IPv6 link-local addresses with scope identifiers (`fe80::…%eth0`)
+- Configurable probe count, per-probe timeout, and port
+- `.onion` (Tor) and `.i2p` address probing via SOCKS5 proxy (auto-detects a
+  local Tor/i2p daemon)
+- Fast RFC 1071 checksum with an x86-64 SIMD inner loop
+- Per-probe and aggregate statistics (success rate, min/avg/max RTT)
 
 ## Requirements
 
-- Linux operating system (Ubuntu 24 or similar)
-- Root/sudo privileges (required for raw socket operations)
-- GCC compiler
-- Standard C libraries
+- Linux operating system
+- GCC or Clang
+- Standard C libraries (POSIX sockets)
+- No root privileges required; `sudo setcap cap_net_raw+ep` optionally enables
+  the raw socket path
 
 ## Building
 
-Compile the program using GCC:
-
 ```bash
-gcc -o ping ping.c -Wall
+make            # release build → ./pong
+make debug      # ASan/UBSan instrumented build
+make native     # -march=native (fastest, host-specific)
+make check      # rebuild with -Werror and run the smoke tests
+make install    # install to /usr/local/bin (override PREFIX=/usr)
+make clean      # remove build artifacts
 ```
+
+Optional overrides: `make BUILD=debug ARCH=native WERROR=1`.
 
 ## Usage
 
-The program requires root privileges to create raw sockets:
-
 ```bash
-sudo ./ping [OPTIONS]
+./pong [OPTIONS]
 ```
 
 ### Command-Line Options
 
 | Option | Long Option | Description | Default |
 |--------|-------------|-------------|---------|
-| `-p` | `--port` | Target port number | 8080 |
-| `-h` | `--target_ip` | Target IPv4 address | localhost |
+| `-h` | `--target_ip` | Target: IP, hostname, IPv6 with `%scope`, or `.onion` / `.i2p` address | `localhost` |
+| `-p` | `--port` | Target port used for `.onion` / `.i2p` probes | 80 |
+| `-c` | `--count` | Number of probes | 30 |
+| `-t` | `--timeout` | Per-probe timeout in seconds | 5 |
+| `-i` | `--interval` | Delay between probes in milliseconds | 1000 |
+| `-f` | `--flood` | Send the full payload in one burst (no interval) | off |
+| `-P` | `--proxy` | SOCKS5 proxy `host[:port]` for `.onion` / `.i2p` probes | auto |
+| `-4` | | Force IPv4 (ICMP only) | auto |
+| `-6` | | Force IPv6 (ICMP only) | auto |
 
 ### Examples
 
-Scan localhost on default port (8080):
+Ping localhost, 30 probes, 1 second apart (defaults):
+
 ```bash
-sudo ./ping
+./pong
 ```
 
-Scan a specific IP address:
+Ping a specific address with only 3 probes:
+
 ```bash
-sudo ./ping -h 192.168.1.100
+./pong -h 192.168.1.100 -c 3
 ```
 
-Scan a specific IP and port:
+Space probes 200 ms apart:
+
 ```bash
-sudo ./ping -h 192.168.1.100 -p 80
+./pong -h 192.168.1.100 -i 200
 ```
 
-Using long options:
+Blast the full 100-packet payload in a single burst (no 1 s overhead):
+
 ```bash
-sudo ./ping --target_ip 192.168.1.100 --port 443
+./pong -h 192.168.1.100 -c 100 -f
+```
+
+Ping a link-local IPv6 neighbor:
+
+```bash
+./pong -h 'fe80::215:5dff:fe00:1%eth0'
+```
+
+Probe a Tor hidden service through a local Tor daemon:
+
+```bash
+./pong -h 'okduskgytldkxiuqc6.onion' -p 80
+```
+
+Probe through a SOCKS5 proxy on a custom address/port:
+
+```bash
+./pong -h 'okduskgytldkxiuqc6.onion' -P '127.0.0.1:9050'
 ```
 
 ## How It Works
 
-1. **Initialization**: The program validates root privileges and parses command-line arguments
-2. **Local IP Detection**: Automatically detects the local machine's IPv4 address from wireless interfaces (wl*)
-3. **Socket Creation**: Creates raw sockets for sending and receiving ICMP packets
-4. **Packet Construction**: Builds custom IP and ICMP headers with proper checksums
-5. **Packet Transmission**: Sends 30 ICMP echo request packets to the target
-6. **Reply Processing**: Listens for ICMP echo replies with a 5-second timeout per packet
-7. **Statistics**: Reports the success rate and detailed information about each packet
+1. **Address resolution**: the target is resolved with `getaddrinfo`,
+   supporting IPv4, IPv6, and IPv6 scope IDs.
+2. **Socket selection**: if `CAP_NET_RAW` is in the process effective set
+   (checked via the raw `capget` syscall, no libcap dependency), a raw socket is
+   opened and the tool builds the IP + ICMP headers itself. Otherwise it uses
+   unprivileged ICMP datagram sockets, whose headers the kernel fills in.
+3. **Packet construction**: builds an ICMP echo request (8 + 32 bytes payload)
+   with proper RFC 1071 checksums — the ICMP checksum in userspace, and the IP
+   header checksum too when the raw IPv4 path is used. ICMPv6 checksums are left
+   to the kernel.
+4. **Paced mode** (default): one probe is sent, its reply awaited (up to
+   `-t`), then the tool sleeps `-i` ms (default 1000) before the next request.
+5. **Flood mode** (`-f`): all `-c` probes are sent back-to-back with no
+   interval — each recording its own send timestamp — then replies are matched
+   by sequence number until every probe is answered or the timeout window
+   elapses.
+6. **Reply processing**: filters for matching echo-reply type, ID, and sequence,
+   and records the RTT.
+7. **Statistics**: reports the success rate and min/avg/max RTT.
+
+For `.onion` / `.i2p` targets the tool performs the ICMP-over-Tor/i2p
+equivalent: it connects to the local SOCKS5 proxy and issues a `CONNECT` for the
+target. Success is determined by the proxy handshake outcome — the proxy only
+connects when the hidden service is reachable. `--flood` is not applicable there
+and is ignored with a notice.
+
+## Project Structure
+
+```
+pong/
+├── Makefile            # release/debug/native/check/install targets
+├── README.md
+├── LICENSE
+├── src/
+│   ├── main.c          # CLI parsing, config, orchestration
+│   ├── ping.c          # ICMP/ICMPv6 scan engine (paced + flood modes)
+│   ├── ping.h          # ping_config type, scan_address/resolve_target API
+│   ├── socks5.c        # SOCKS5 CONNECT probing, proxy host:port parsing
+│   ├── socks5.h
+│   ├── checksum.c      # RFC 1071 checksum (x86-64 SIMD inner loop)
+│   ├── checksum.h
+│   ├── util.c          # parsing, address/capability helpers, socket I/O
+│   └── util.h
+└── tests/
+    └── smoke.sh        # functional smoke test suite (make check)
+```
 
 ## Technical Details
 
-### ICMP Packet Structure
+### Checksum
 
-The program constructs raw ICMP packets with:
-- **IP Header**: Version 4, TTL 64, Protocol ICMP
-- **ICMP Header**: Type ECHO (8), Code 0
-- **Data Payload**: 32 bytes of 'A' characters
+The RFC 1071 Internet checksum is computed over the packet as 8-byte words into
+a 64-bit accumulator with end-around carry folding on every addition. On x86-64
+the inner loop is inline assembly using the `ADC` instruction (which chains the
+carry flag across additions), unrolled four words per iteration. A portable
+unrolled-by-four fallback is used on other architectures.
 
-### Checksum Calculation
+### Build Flags
 
-Uses the standard Internet checksum algorithm (RFC 1071) for both IP and ICMP headers.
-
-### Configuration Constants
-
-- `ICMP_PACKET_CNT`: Number of packets to send (30)
-- `ICMP_PACKET_DATA`: Size of ICMP data payload (32 bytes)
-- Receive timeout: 5 seconds per packet
+The release build uses `-O3 -flto -fno-plt` plus standard hardening:
+`-fstack-protector-strong -fPIE -pie` with full RELRO and a non-executable
+stack, and `-D_FORTIFY_SOURCE=2`. The debug build is `-O0 -g3` with AddressSanitizer
+and UndefinedBehaviorSanitizer. `make check` compiles with `-Werror` alongside a
+strict warning set (`-Wall -Wextra -Wpedantic -Wshadow -Wwrite-strings
+-Wmissing-prototypes -Wformat=2 …`) and runs the smoke suite.
 
 ## Output
 
-The program provides detailed output including:
-- Local IPv4 address detection
-- Bytes sent per packet
-- Received packet information (source IP, TTL, sequence number, ICMP type)
-- Echo reply confirmations
-- Final success statistics with percentage
-
-Example output:
 ```
-Getting current IPv4 address ...
-Current ipv4 address of the machine: 192.168.1.50
-Starting network scan...
-Sending ICMP to the ipv4 adress: 192.168.1.100
-Sent 84 bytes ...
-Received 84 byte packets from=192.168.1.100   ip_ttl=64   icmp_seq=0   icmp_type=8 ( Received ECHO REPLY from 192.168.1.100)
-...
-Ping test completed ! 28/30 (93.3333%) transmitted successfully
+Pinging 127.0.0.1 (IPv4) via unprivileged ICMP datagram socket
+Received 40 bytes  from=127.0.0.1  seq=0  type=0  rtt=0.04 ms  (ECHO REPLY)
+Received 40 bytes  from=127.0.0.1  seq=1  type=0  rtt=0.05 ms  (ECHO REPLY)
+Received 40 bytes  from=127.0.0.1  seq=2  type=0  rtt=0.06 ms  (ECHO REPLY)
+Ping done: 3/3 (100.0%) succeeded, rtt min/avg/max = 0.04/0.05/0.05 ms
 ```
 
 ## Error Handling
 
-The program handles various error conditions:
-- Insufficient privileges (non-root execution)
-- Socket creation failures
+- Socket creation failures (with a hint to enable unprivileged ICMP)
+- Send/recv failures
+- Timeouts (no response)
+- Invalid proxy specifications
+- Unresolvable hosts
 - Memory allocation failures
-- Packet send/receive failures
-- Timeout conditions (no response)
-- Invalid ICMP packet formats
 
-## Network Interface Detection
+## Enabling the Fast Path
 
-The program automatically detects the local IPv4 address by:
-1. Enumerating all network interfaces
-2. Filtering for IPv4 addresses (AF_INET)
-3. Selecting wireless interfaces (names starting with "wl")
+Unprivileged ICMP datagram sockets work out of the box on most systems. To use
+raw sockets instead:
 
-If no suitable interface is found, the program returns an error.
+```bash
+# Allow unprivileged ICMP (kernel 4.11+), if not already enabled
+sudo sysctl -w net.ipv4.ping_group_range='0 2147483647'
+
+# Or grant raw socket capability to the binary
+sudo setcap cap_net_raw+ep ./pong
+```
 
 ## Limitations
 
-- Only supports IPv4 addresses
-- Requires wireless interface (wl*) for automatic IP detection
-- Requires root privileges for raw socket operations
-- Fixed packet count (30 packets)
-- Fixed timeout (5 seconds per packet)
-- Does not support IPv6
+- `.onion` / `.i2p` probes require a running local SOCKS5 proxy (Tor or i2pd)
+  unless overridden with `-P`.
+- `--flood` applies to ICMP probes only; it is ignored (with a notice) for
+  `.onion` / `.i2p` targets.
+- Some networks block ICMP entirely.
 
 ## Security Considerations
 
-⚠️ **Warning**: This tool requires root privileges and uses raw sockets. Use responsibly and only on networks you own or have permission to scan.
+⚠️ **Warning**: This tool sends network probes. Use responsibly and only on
+networks you own or have permission to scan.
 
 - Raw socket access can be a security risk
 - Ensure proper network permissions before scanning
@@ -152,63 +226,40 @@ If no suitable interface is found, the program returns an error.
 
 ## Troubleshooting
 
-### "This program requires root privileges to run"
-Run the program with `sudo`:
+### "socket(AF_INET, ICMP): Operation not permitted"
+Your kernel does not allow unprivileged ICMP sockets and you lack `CAP_NET_RAW`.
+Run:
+
 ```bash
-sudo ./ping
+sudo sysctl -w net.ipv4.ping_group_range='0 2147483647'
 ```
 
-### "No TCP interface found"
-The program cannot detect a wireless interface. Possible solutions:
-- Ensure you have a wireless adapter connected
-- Modify the `checkIfName()` function to match your interface naming (e.g., "eth", "en")
+or grant the capability:
 
-### "Failed to create a new socket"
-- Verify root privileges
-- Check if raw socket support is enabled in your kernel
-- Ensure no firewall is blocking raw socket operations
+```bash
+sudo setcap cap_net_raw+ep ./pong
+```
 
 ### Timeouts
-If you experience many timeouts:
 - Verify the target IP is correct and reachable
 - Check firewall rules on both source and destination
-- Verify the target host responds to ICMP requests
-- Some hosts may have ICMP disabled
+- Verify the target responds to ICMP requests
+- Some hosts have ICMP disabled
 
-## Code Structure
-
-```
-network_scanner_documented.c
-├── Data Structures
-│   └── NetworkEndpoint
-├── Utility Functions
-│   ├── csum() - Checksum calculation
-│   ├── ConvertStrToInt() - String to integer conversion
-│   ├── checkIfName() - Interface name validation
-│   └── getCurrentIpv4Addr() - Local IP detection
-├── Core Functions
-│   ├── InitEndpoint() - Endpoint initialization
-│   └── ScanNetworkEndpoint() - Main scanning logic
-└── main() - Entry point and argument parsing
-```
-
-## Contributing
-
-Contributions are welcome! Areas for improvement:
-- IPv6 support
-- Configurable packet count and timeout
-- Support for additional network interface types
-- TCP/UDP scanning capabilities
-- Enhanced error reporting
-- Configuration file support
+### `.onion` / `.i2p` probes all time out
+- Ensure a local Tor/i2p SOCKS5 proxy is running (Tor default: `127.0.0.1:9050`)
+- Specify it explicitly with `-P`
 
 ## License
 
-This is educational/demonstration code. Use at your own risk and ensure compliance with local laws and network policies.
+This is educational/demonstration code. Use at your own risk and ensure
+compliance with local laws and network policies.
 
 ## Disclaimer
 
-This tool is provided for educational and network administration purposes only. Always obtain proper authorization before scanning networks. Unauthorized network scanning may be illegal in your jurisdiction.
+This tool is provided for educational and network administration purposes only.
+Always obtain proper authorization before scanning networks. Unauthorized
+network scanning may be illegal in your jurisdiction.
 
 ## Author
 
@@ -216,4 +267,4 @@ Sergio Randriamihoatra <sergiorandriamihoatra@gmail.com>
 
 ## Version
 
-1.0.0
+3.0.0
